@@ -47,6 +47,8 @@ public:
                                                 std::memory_order_relaxed));
     }
 
+    /// Hands every collected CPU write range to callback and clears them. Safe to call from
+    /// several threads at once.
     void Gather(std::function<void(PAddr, size_t)>& callback) {
         // FlushRegion also gathers off the GPU thread (host1x video decode reads); serialize
         // gatherers so one cannot swap or clear front_buffer while another iterates it.
