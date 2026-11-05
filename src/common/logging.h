@@ -141,6 +141,10 @@ void Start();
 /// Explicitly stops the logger thread and flushes the buffers
 void Stop();
 
+/// Flushes and closes the log file so another process can rotate it; the other backends keep
+/// logging. Call it only once no other thread can log, like FileBackend writes themselves.
+void CloseLogFile();
+
 /// The global filter will prevent any messages from even being processed if they are filtered.
 void SetGlobalFilter(const Filter& filter);
 void SetColorConsoleBackendEnabled(bool enabled);

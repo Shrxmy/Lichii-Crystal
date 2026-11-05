@@ -258,9 +258,50 @@ struct SdlState {
 
 constexpr int kRestartExitCode = 75;
 static std::atomic_bool restart_requested{false};
+#ifndef _WIN32
+static std::vector<std::string> restart_argv;
+#endif
+
+/// Starts eden-cli again with the same arguments and EDEN_CLI_RESTART_HANDOFF set, so a game that
+/// restarts itself comes back without a launcher. Returns the exit code to leave with: 0 once the
+/// new instance runs, kRestartExitCode if it could not be started.
+static int RelaunchSelf() {
+#ifdef _WIN32
+    SetEnvironmentVariableW(L"EDEN_CLI_RESTART_HANDOFF", L"1");
+    std::wstring exe(MAX_PATH, L'\0');
+    for (;;) {
+        const DWORD length = GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
+        if (length < exe.size()) {
+            exe.resize(length);
+            break;
+        }
+        exe.resize(exe.size() * 2); // truncated: retry with a larger buffer
+    }
+    std::wstring command_line{GetCommandLineW()};
+    STARTUPINFOW startup{.cb = sizeof(STARTUPINFOW)};
+    PROCESS_INFORMATION process{};
+    if (exe.empty() || !CreateProcessW(exe.c_str(), command_line.data(), nullptr, nullptr, FALSE, 0,
+                                       nullptr, nullptr, &startup, &process)) {
+        return kRestartExitCode;
+    }
+    // Exit instead of waiting: each restart would otherwise keep a shut-down instance's memory.
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return 0;
+#else
+    setenv("EDEN_CLI_RESTART_HANDOFF", "1", 1);
+    std::vector<char*> args;
+    for (auto& arg : restart_argv) {
+        args.push_back(arg.data());
+    }
+    args.push_back(nullptr);
+    execvp(args[0], args.data());
+    return kRestartExitCode; // only reached when exec failed
+#endif
+}
 
 // ExecuteProgram state for the restarted process: what the Qt frontend keeps in-process when it
-// reboots a game. Only read when the launcher sets EDEN_CLI_RESTART_HANDOFF, so a leftover file
+// reboots a game. Only read when the relaunch sets EDEN_CLI_RESTART_HANDOFF, so a leftover file
 // never changes a normal launch.
 struct RestartHandoff {
     u64 program_id{};
@@ -288,6 +329,7 @@ static void GetRaw(std::istream& in, T& value) {
 constexpr u32 kHandoffMaxEntries = 256;
 constexpr u64 kHandoffMaxTotalSize = 64u << 20;
 
+/// Writes the handoff for the restarted process. Returns false if it is too large or not written.
 static bool WriteRestartHandoff(const RestartHandoff& handoff) {
     u64 total = 0;
     for (const auto& entry : handoff.user_channel) {
@@ -309,7 +351,8 @@ static bool WriteRestartHandoff(const RestartHandoff& handoff) {
     return !out.fail();
 }
 
-// Leaves the file in place; the caller removes it once the game has loaded.
+/// Reads the handoff, or nullopt if it is missing, truncated or over the limits. Leaves the file in
+/// place; the caller removes it once the game has loaded.
 static std::optional<RestartHandoff> ReadRestartHandoff() {
     std::ifstream in{RestartHandoffPath(), std::ios::binary};
     RestartHandoff handoff;
@@ -479,6 +522,7 @@ static bool EditNup(const Core::LaunchParams& lp) {
     }
 }
 
+/// Parses the command line, sets up the window and system, and boots the game.
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #ifdef _WIN32
     SetUnhandledExceptionFilter(WriteCrashDump);
@@ -510,6 +554,9 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     Common::Log::SetColorConsoleBackendEnabled(true);
     Common::Log::Start();
 
+#ifndef _WIN32
+    restart_argv.assign(argv, argv + argc);
+#endif
     int option_index = 0;
 #ifdef _WIN32
     int argc_w;
@@ -673,8 +720,8 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     state->system.RegisterExitCallback([] {});
 
     // A game executing a program (e.g. restarting after a settings change) writes its launch state
-    // to the restart handoff and quits with kRestartExitCode; the launcher boots the same file again
-    // with EDEN_CLI_RESTART_HANDOFF set. Mirrors MainWindow::OnExecuteProgram.
+    // to the restart handoff and quits; SDL_AppQuit then starts eden-cli again on the same file with
+    // EDEN_CLI_RESTART_HANDOFF set. Mirrors MainWindow::OnExecuteProgram.
     state->system.RegisterExecuteProgramCallback([system = &state->system](std::size_t program_index) {
         RestartHandoff handoff{
             .program_index = static_cast<s32>(program_index),
@@ -780,6 +827,7 @@ static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem) {
     }
 }
 
+/// Runs once per main-loop tick; ends the loop when the window closes or the game restarts.
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
     RunKeyScript(state->input_subsystem);
@@ -797,6 +845,7 @@ extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
         state->emu_window->OnEvent(*event);
     return SDL_APP_CONTINUE;
 }
+/// Shuts the system down, then relaunches eden-cli if the game asked to restart.
 extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     SdlState *state = (SdlState *)appstate;
     if (!state) {
@@ -816,9 +865,11 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
         Network::Shutdown();
     }
     if (restart_requested) {
-        // SDL3 maps SDL_APP_SUCCESS to exit code 0; quit SDL ourselves to return the restart code.
+        // SDL3 maps SDL_APP_SUCCESS to exit code 0; quit SDL ourselves to report a failed
+        // relaunch. The log closes first, as the new instance rotates the same file.
         SDL_Quit();
-        std::exit(kRestartExitCode);
+        Common::Log::CloseLogFile();
+        std::exit(RelaunchSelf());
     }
 }
 

@@ -446,6 +446,15 @@ void Stop() {
         logging_instance->ForEachBackend([](Backend& backend) { backend.Flush(); });
 }
 
+void CloseLogFile() {
+#ifndef __OPENORBIS__
+    if (logging_instance) {
+        Stop();
+        logging_instance->file_backend.reset();
+    }
+#endif
+}
+
 void SetGlobalFilter(const Filter& filter) {
     if (logging_instance)
         logging_instance->filter = filter;
